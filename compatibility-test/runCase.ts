@@ -17,6 +17,57 @@ setTracingDisabled(true);
 
 const ajv = new Ajv();
 
+const LOG_NAMESPACE = "runCase";
+const debugEnabled = process.env.RUN_CASE_DEBUG === "1";
+
+function safeStringify(payload: unknown): string {
+  if (typeof payload === "string") {
+    return payload;
+  }
+  try {
+    return JSON.stringify(payload);
+  } catch (error) {
+    return String(payload);
+  }
+}
+
+function emitLog(
+  logger: ((message: string) => void) | undefined,
+  message: string,
+  payload?: unknown,
+) {
+  if (logger) {
+    const suffix = payload !== undefined ? ` ${safeStringify(payload)}` : "";
+    try {
+      logger(`${message}${suffix}`);
+    } catch (error) {
+      if (debugEnabled) {
+        // eslint-disable-next-line no-console
+        console.log(`[${LOG_NAMESPACE}] logger error`, error);
+      }
+    }
+  }
+
+  if (!debugEnabled) {
+    return;
+  }
+
+  if (payload === undefined) {
+    // eslint-disable-next-line no-console
+    console.log(`[${LOG_NAMESPACE}] ${message}`);
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(`[${LOG_NAMESPACE}] ${message}`, payload);
+  }
+}
+
+export type RunCaseOptions = {
+  maxTurns: number;
+  streaming: boolean;
+  strict: boolean;
+  log?: (message: string) => void;
+};
+
 export type Case = {
   tool_name: string;
   input: string;
@@ -39,11 +90,7 @@ export type RunCaseSummary = {
 export async function runCase(
   provider: string,
   caseData: Case,
-  {
-    maxTurns,
-    streaming,
-    strict,
-  }: { maxTurns: number; streaming: boolean; strict: boolean }
+  options: RunCaseOptions,
 ): Promise<RunCaseSummary[]> {
   const config = PROVIDERS[provider];
   if (!config) {
@@ -54,6 +101,8 @@ export async function runCase(
     );
   }
 
+  const { maxTurns, streaming, strict, log } = options;
+
   const agent = new Agent({
     name: caseData.tool_name,
     instructions: caseData.instructions,
@@ -63,6 +112,13 @@ export async function runCase(
   const client = new OpenAI({
     apiKey: config.apiKey,
     baseURL: config.apiBaseUrl,
+  });
+
+  emitLog(log, "starting runCase", {
+    provider,
+    streaming,
+    strict,
+    tool: caseData.tool_name,
   });
 
   const summaries: RunCaseSummary[] = [];
@@ -103,17 +159,23 @@ export async function runCase(
       });
     }
 
-    const { success: successToolCall, details: toolCallingDetails } =
-      testToolCall(apiType, caseData, result, strict);
+    const { success: successToolCall, details: toolCallingDetails } = testToolCall(
+      apiType,
+      caseData,
+      result,
+      strict,
+      log,
+    );
 
     const { validResponse, details } = testOutputData(
       apiType,
       result.rawResponses,
-      streaming
+      streaming,
+      log,
     );
 
     const { validEvents, details: eventsDetails } = streaming
-      ? testEvents(apiType, streamedEvents ?? [])
+      ? testEvents(apiType, streamedEvents ?? [], log)
       : { validEvents: true, details: {} };
 
     let success = successToolCall && validResponse;
@@ -134,20 +196,23 @@ export async function runCase(
       toolCallingDetails,
     };
 
+    emitLog(log, "runCase summary", {
+      apiType,
+      success,
+      toolCallingDetails,
+      details: summary.details,
+    });
+
     summaries.push(summary);
   }
 
   return summaries;
 }
 
-function testToolCall(apiType, caseData, result, strict) {
+function testToolCall(apiType, caseData, result, strict, log?: (message: string) => void) {
   const details: Record<string, any> = {};
 
   for (const item of result.newItems ?? []) {
-    if (details.calledToolAtLeastOnce && (!strict || details.calledToolWithRightArguments)) {
-      break;
-    }
-
     if (item?.type !== "tool_call_item") {
       continue;
     }
@@ -172,9 +237,17 @@ function testToolCall(apiType, caseData, result, strict) {
     const schemaValid = validate(parsedArguments);
     details.calledToolWithRightSchema = schemaValid;
 
+    emitLog(log, "tool call inspected", {
+      apiType,
+      toolName,
+      schemaValid,
+      parsedArguments,
+    });
+
     if (!schemaValid) {
       if (validate.errors) {
         details.schemaErrors = validate.errors;
+        emitLog(log, "schema validation errors", validate.errors);
       }
       continue;
     }
@@ -187,6 +260,11 @@ function testToolCall(apiType, caseData, result, strict) {
       details.warning = `Tool call with wrong arguments but correct schema. Parsed: ${JSON.stringify(parsedArguments)} Expected: ${JSON.stringify(expectedArguments)}`;
       details.actualArguments = parsedArguments;
       details.expectedArguments = expectedArguments;
+      emitLog(log, "tool argument mismatch", {
+        parsedArguments,
+        expectedArguments,
+        strict,
+      });
     }
   }
 
@@ -199,11 +277,16 @@ function testToolCall(apiType, caseData, result, strict) {
   };
 }
 
-function testEvents(apiType, events) {
+function testEvents(apiType, events, log?: (message: string) => void) {
   let details: Record<string, boolean> = {};
   let validEvents: boolean = false;
 
   const observedEvents = events ?? [];
+
+  if (observedEvents.length === 0) {
+    details.missingEvents = true;
+    emitLog(log, "no streaming events observed", { apiType });
+  }
 
   if (apiType === "chat") {
     let hasReasoningDeltas = false;
@@ -216,6 +299,10 @@ function testEvents(apiType, events) {
     }
     details.hasReasoningDeltas = hasReasoningDeltas;
     validEvents = hasReasoningDeltas;
+    emitLog(log, "chat streaming check", {
+      hasReasoningDeltas,
+      eventCount: observedEvents.length,
+    });
   }
 
   if (apiType === "responses") {
@@ -242,10 +329,11 @@ function testEvents(apiType, events) {
     details.hasReasoningDeltaEvents = hasReasoningDeltaEvents;
     details.hasReasoningDoneEvents = hasReasoningDoneEvents;
     validEvents = hasReasoningDeltaEvents && hasReasoningDoneEvents;
-  }
-
-  if (observedEvents.length === 0) {
-    details.missingEvents = true;
+    emitLog(log, "responses streaming check", {
+      hasReasoningDeltaEvents,
+      hasReasoningDoneEvents,
+      eventCount: observedEvents.length,
+    });
   }
 
   return {
@@ -254,7 +342,7 @@ function testEvents(apiType, events) {
   };
 }
 
-function testOutputData(apiType, rawResponses, streaming) {
+function testOutputData(apiType, rawResponses, streaming, log?: (message: string) => void) {
   let details: Record<string, boolean> = {};
   let validResponse: boolean = false;
 
@@ -299,6 +387,7 @@ function testOutputData(apiType, rawResponses, streaming) {
     const data = top.providerData ?? top;
 
     if (!data || !Array.isArray(data.output)) {
+      emitLog(log, "responses output missing", { dataPresent: !!data });
       return { validResponse: false, details: { missingOutput: true } };
     }
 
@@ -310,26 +399,31 @@ function testOutputData(apiType, rawResponses, streaming) {
 
     for (const item of data.output) {
       if (item.type === "reasoning") {
-        details.hasReasoningContentArray = Array.isArray(item.content);
-        details.hasReasoningContentArrayLength =
-          details.hasReasoningContentArray && item.content.length > 0;
-        details.hasReasoningContentArrayItemType =
-          details.hasReasoningContentArray &&
-          item.content.every(
-            (c: any) => c.type === "reasoning_text" || c.type === "input_text"
-          );
-        details.hasReasoningContentArrayItemText =
-          details.hasReasoningContentArray &&
-          item.content.every(
-            (c: any) => typeof c.text === "string" && c.text.length > 0
-          );
+        const contentArray = Array.isArray(item.content) ? item.content : [];
+        const hasSummaryArray = Array.isArray(item.summary) && item.summary.length > 0;
 
-        validResponse =
-          validResponse ||
-          (details.hasReasoningContentArray &&
-            details.hasReasoningContentArrayLength &&
-            details.hasReasoningContentArrayItemType &&
-            details.hasReasoningContentArrayItemText);
+        details.hasReasoningContentArray = Array.isArray(item.content);
+        details.hasReasoningContentArrayLength = contentArray.length > 0;
+        details.hasReasoningContentArrayItemType = contentArray.every(
+          (c: any) => c.type === "reasoning_text" || c.type === "input_text",
+        );
+        details.hasReasoningContentArrayItemText = contentArray.every(
+          (c: any) => typeof c.text === "string" && c.text.length > 0,
+        );
+        details.hasReasoningSummary = hasSummaryArray;
+
+        const hasValidContent =
+          details.hasReasoningContentArray &&
+          details.hasReasoningContentArrayLength &&
+          details.hasReasoningContentArrayItemType &&
+          details.hasReasoningContentArrayItemText;
+
+        validResponse = validResponse || hasValidContent || hasSummaryArray;
+        emitLog(log, "responses reasoning check", {
+          hasValidContent,
+          hasSummaryArray,
+          itemSummaryLength: Array.isArray(item.summary) ? item.summary.length : undefined,
+        });
       }
     }
   }

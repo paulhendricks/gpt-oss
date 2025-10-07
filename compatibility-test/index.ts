@@ -180,6 +180,7 @@ async function main() {
         maxTurns,
         streaming,
         strict,
+        log: logMessage,
       });
 
       logMessage(

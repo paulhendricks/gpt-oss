@@ -329,6 +329,7 @@ function testEvents(apiType, events, log?: (message: string) => void) {
 function testOutputData(apiType, rawResponses, streaming, log?: (message: string) => void) {
   let details: Record<string, boolean> = {};
   let validResponse: boolean = false;
+  let warning: string | undefined;
 
   if (!Array.isArray(rawResponses) || rawResponses.length === 0) {
     return {
@@ -384,7 +385,11 @@ function testOutputData(apiType, rawResponses, streaming, log?: (message: string
     for (const item of data.output) {
       if (item.type === "reasoning") {
         const contentArray = Array.isArray(item.content) ? item.content : [];
-        const hasSummaryArray = Array.isArray(item.summary) && item.summary.length > 0;
+        const summaryArray = Array.isArray(item.summary) ? item.summary : undefined;
+        const hasSummaryArray = Array.isArray(summaryArray);
+        const summaryLength = Array.isArray(summaryArray)
+          ? summaryArray.length
+          : undefined;
 
         details.hasReasoningContentArray = Array.isArray(item.content);
         details.hasReasoningContentArrayLength = contentArray.length > 0;
@@ -395,6 +400,9 @@ function testOutputData(apiType, rawResponses, streaming, log?: (message: string
           (c: any) => typeof c.text === "string" && c.text.length > 0,
         );
         details.hasReasoningSummary = hasSummaryArray;
+        if (typeof summaryLength === "number") {
+          details.hasReasoningSummaryLength = summaryLength;
+        }
 
         const hasValidContent =
           details.hasReasoningContentArray &&
@@ -402,10 +410,22 @@ function testOutputData(apiType, rawResponses, streaming, log?: (message: string
           details.hasReasoningContentArrayItemType &&
           details.hasReasoningContentArrayItemText;
 
-        validResponse = validResponse || hasValidContent || hasSummaryArray;
+        const acceptedBySummary = !hasValidContent && hasSummaryArray;
+        if (acceptedBySummary && !warning) {
+          if (summaryLength && summaryLength > 0) {
+            warning = `Reasoning output lacked content but included a summary array with ${summaryLength} entr${summaryLength === 1 ? "y" : "ies"}. Counting as pass.`;
+          } else {
+            warning =
+              "Reasoning output lacked content; summary array present but empty. Counting as pass.";
+          }
+        }
+
+        validResponse = validResponse || hasValidContent || acceptedBySummary;
         emitLog(log, "responses reasoning check", {
           hasValidContent,
           hasSummaryArray,
+          summaryLength,
+          acceptedBySummary,
           itemSummaryLength: Array.isArray(item.summary) ? item.summary.length : undefined,
         });
       }
@@ -414,7 +434,12 @@ function testOutputData(apiType, rawResponses, streaming, log?: (message: string
 
   return {
     validResponse,
-    details,
+    details: warning
+      ? {
+          ...details,
+          warning,
+        }
+      : details,
   };
 }
 

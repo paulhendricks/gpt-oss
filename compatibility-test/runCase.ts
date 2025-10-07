@@ -17,9 +17,6 @@ setTracingDisabled(true);
 
 const ajv = new Ajv();
 
-const LOG_NAMESPACE = "runCase";
-const debugEnabled = process.env.RUN_CASE_DEBUG === "1";
-
 function safeStringify(payload: unknown): string {
   if (typeof payload === "string") {
     return payload;
@@ -36,28 +33,15 @@ function emitLog(
   message: string,
   payload?: unknown,
 ) {
-  if (logger) {
-    const suffix = payload !== undefined ? ` ${safeStringify(payload)}` : "";
-    try {
-      logger(`${message}${suffix}`);
-    } catch (error) {
-      if (debugEnabled) {
-        // eslint-disable-next-line no-console
-        console.log(`[${LOG_NAMESPACE}] logger error`, error);
-      }
-    }
-  }
-
-  if (!debugEnabled) {
+  if (!logger) {
     return;
   }
 
-  if (payload === undefined) {
-    // eslint-disable-next-line no-console
-    console.log(`[${LOG_NAMESPACE}] ${message}`);
-  } else {
-    // eslint-disable-next-line no-console
-    console.log(`[${LOG_NAMESPACE}] ${message}`, payload);
+  const suffix = payload !== undefined ? ` ${safeStringify(payload)}` : "";
+  try {
+    logger(`${message}${suffix}`);
+  } catch (error) {
+    // Swallow logger errors so we never disrupt the run loop.
   }
 }
 

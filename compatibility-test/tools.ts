@@ -1,5 +1,15 @@
+/**
+ * Canonical tool definitions used by every compatibility test case. These are
+ * wrapped into executable Agent tools so the harness can validate provider
+ * tool calls without invoking real backends.
+ */
 import { Tool, tool } from "@openai/agents";
 
+/**
+ * Convert a static tool description into an executable Agent tool that returns
+ * a deterministic payload. Providers are expected to call these functions with
+ * arguments matching the JSON schema declared alongside each entry.
+ */
 function convertToTool(toolData: any) {
   return tool({
     name: toolData.name,
@@ -12,6 +22,11 @@ function convertToTool(toolData: any) {
   });
 }
 
+/**
+ * Declarative catalog of sample tools. The harness reuses these fixtures across
+ * all providers so argument validation and reasoning expectations remain
+ * consistent.
+ */
 export const TOOLS = [
   {
     type: "function",
@@ -150,6 +165,11 @@ export const TOOLS = [
   },
 ];
 
+/**
+ * Convenience lookup for retrieving the executable `FunctionTool` instance by
+ * name. This mirrors the shape expected by the Agents SDK when constructing an
+ * `Agent`.
+ */
 export const TOOLS_MAP = TOOLS.reduce((acc, tool) => {
   acc[tool.name] = convertToTool(tool);
   return acc;

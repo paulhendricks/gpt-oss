@@ -1,3 +1,14 @@
+/**
+ * Compatibility harness for exercising provider implementations of OpenAI's
+ * Responses and Chat Completions interfaces. The exported `runCase` utility
+ * executes a single test case across every configured API type, aggregates the
+ * raw provider payloads, and evaluates whether the provider satisfied the
+ * expected tool-calling and reasoning contracts.
+ *
+ * The module favors explicit logging and structured summaries so downstream
+ * tooling—CLI logs, rollout JSONL files, and analytics—can explain why a given
+ * attempt passed or failed without re-running the test.
+ */
 import {
   Agent,
   Runner,
@@ -17,6 +28,11 @@ setTracingDisabled(true);
 
 const ajv = new Ajv();
 
+/**
+ * Safely serialize debug payloads for log output. We defensively stringify to
+ * avoid crashing when providers return circular references or other structures
+ * that `JSON.stringify` cannot process.
+ */
 function safeStringify(payload: unknown): string {
   if (typeof payload === "string") {
     return payload;
@@ -28,6 +44,11 @@ function safeStringify(payload: unknown): string {
   }
 }
 
+/**
+ * Emit a structured diagnostic entry to the optional logger supplied by the
+ * CLI. Logging is intentionally best-effort: failures are swallowed so we
+ * never compromise the main compatibility run.
+ */
 function emitLog(
   logger: ((message: string) => void) | undefined,
   message: string,
@@ -45,6 +66,18 @@ function emitLog(
   }
 }
 
+/**
+ * Per-case runner configuration supplied by the CLI.
+ *
+ * - `maxTurns` mirrors the agent exchange limit. Providers that require
+ *   multiple clarification loops can bump this in the CLI.
+ * - `streaming` toggles between unary `RunResult` and streaming
+ *   `StreamedRunResult` execution paths.
+ * - `strict` enforces an exact match between emitted tool arguments and the
+ *   JSON supplied in the case definition.
+ * - `log` (optional) accepts the CLI logger so `runCase` diagnostics land in
+ *   the same verbose log file the CLI writes when `--verbose` is set.
+ */
 export type RunCaseOptions = {
   maxTurns: number;
   streaming: boolean;
@@ -52,6 +85,11 @@ export type RunCaseOptions = {
   log?: (message: string) => void;
 };
 
+/**
+ * Minimal description of a single compatibility test. Every entry is mirrored
+ * in `cases.jsonl` and can optionally supplement the agent with additional
+ * instructions beyond the natural-language input.
+ */
 export type Case = {
   tool_name: string;
   input: string;
@@ -59,7 +97,14 @@ export type Case = {
   instructions?: string;
 };
 
-// Summary shape for each apiType
+/**
+ * Summary returned for each API type the provider exposes. A single call to
+ * `runCase` can yield multiple entries (e.g., `responses` and `chat`).
+ *
+ * `details` and `toolCallingDetails` intentionally capture raw booleans and
+ * warnings so higher-level reports can render human-readable diagnostics
+ * without rehydrating provider payloads.
+ */
 export type RunCaseSummary = {
   apiType: string;
   success: boolean;
@@ -71,6 +116,15 @@ export type RunCaseSummary = {
   toolCallingDetails: Record<string, any>;
 };
 
+/**
+ * Execute a single compatibility test against the specified provider. The
+ * harness iterates over every API type declared in the provider config so a
+ * single case can be replayed against both Responses and Chat Completions.
+ *
+ * Each iteration gathers raw responses, streaming events (when enabled), and
+ * validation artifacts. The function returns a summary per API type so callers
+ * can persist granular pass/fail information.
+ */
 export async function runCase(
   provider: string,
   caseData: Case,
@@ -121,12 +175,15 @@ export async function runCase(
     let result: RunResult<any, any> | StreamedRunResult<any, any>;
     let streamedEvents: any[] | undefined = undefined;
     if (streaming) {
+      // Request a streaming interaction so we can capture reasoning deltas in
+      // real time. Providers that honor the stream flag return an async
+      // iterator exposing raw model events.
       result = await runner.run(agent, caseData.input, {
         stream: streaming,
         maxTurns: maxTurns,
       });
       if (result instanceof StreamedRunResult) {
-        // Collect streaming events if applicable
+        // Accumulate streaming events for post-run validation.
         streamedEvents = [];
         for await (const event of result) {
           if (event.type === "raw_model_stream_event") {
@@ -193,10 +250,24 @@ export async function runCase(
   return summaries;
 }
 
-function testToolCall(apiType, caseData, result, strict, log?: (message: string) => void) {
+/**
+ * Validate that the provider issued the expected tool call at least once and
+ * that the emitted arguments satisfy the declared JSON schema. When `strict`
+ * mode is active we additionally require a deep-equal match against the test
+ * case's `expected_arguments`.
+ */
+function testToolCall(
+  apiType,
+  caseData,
+  result,
+  strict,
+  log?: (message: string) => void,
+) {
   const details: Record<string, any> = {};
 
   for (const item of result.newItems ?? []) {
+    // Do not early-return: later turns may contain the first valid tool call,
+    // especially when the provider emits observations before invoking tools.
     if (item?.type !== "tool_call_item") {
       continue;
     }
@@ -261,6 +332,12 @@ function testToolCall(apiType, caseData, result, strict, log?: (message: string)
   };
 }
 
+/**
+ * Evaluate streaming event sequences for the reasoning signals exposed by the
+ * OpenAI Responses and Chat Completions APIs. Providers that opt out of
+ * streaming or omit the reasoning events are marked as invalid so parity gaps
+ * surface during compatibility sweeps.
+ */
 function testEvents(apiType, events, log?: (message: string) => void) {
   let details: Record<string, boolean> = {};
   let validEvents: boolean = false;
@@ -326,6 +403,13 @@ function testEvents(apiType, events, log?: (message: string) => void) {
   };
 }
 
+/**
+ * Inspect the provider's final response payloads. For unary Chat runs we
+ * require at least one assistant message with textual reasoning. For Responses
+ * runs we accept either populated `reasoning_text` items or a `summary` array.
+ * The latter is treated as a soft pass and surfaces a warning so downstream
+ * reviewers know the provider returned minimal reasoning detail.
+ */
 function testOutputData(apiType, rawResponses, streaming, log?: (message: string) => void) {
   let details: Record<string, boolean> = {};
   let validResponse: boolean = false;
@@ -443,6 +527,12 @@ function testOutputData(apiType, rawResponses, streaming, log?: (message: string
   };
 }
 
+/**
+ * Convert tool arguments into a comparable object. Providers frequently return
+ * arguments as JSON strings; this helper ensures we can validate with AJV and
+ * compare against the expected payload without caring about the original
+ * encoding.
+ */
 function normalizeArguments(payload: unknown): Record<string, any> {
   if (payload == null) {
     return {};
@@ -463,6 +553,11 @@ function normalizeArguments(payload: unknown): Record<string, any> {
   return {};
 }
 
+/**
+ * Recursively compare two JSON-like structures for equality. AJV guarantees
+ * the schema shape, but strict mode requires us to verify the provider
+ * supplied exactly the same values as the test case.
+ */
 function deepEqual(a: any, b: any): boolean {
   if (a === b) return true;
   if (typeof a !== typeof b) return false;

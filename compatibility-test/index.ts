@@ -1,3 +1,8 @@
+/**
+ * Command-line entrypoint for the compatibility harness. This script ties the
+ * runner, logging, and analysis utilities together so a single invocation can
+ * execute every case, capture detailed logs, and compute summary statistics.
+ */
 import { parseArgs } from "node:util";
 import { createWriteStream } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
@@ -7,6 +12,10 @@ import { runCase, RunCaseSummary } from "./runCase";
 import { Listr, ListrTaskWrapper } from "listr2";
 import { analyze, printAnalysis } from "./analysis";
 
+/**
+ * Format a `Date` as the `<YYYYMMDD>_<HHMMSS>` string used to namespace
+ * rollout, log, and analysis files.
+ */
 function formatTimestamp(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   const yyyy = d.getFullYear();
@@ -18,6 +27,11 @@ function formatTimestamp(d: Date): string {
   return `${yyyy}${mm}${dd}_${hh}${mi}${ss}`;
 }
 
+/**
+ * Top-level driver: parses CLI flags, configures logging destinations, loads
+ * the cases file, and schedules each case attempt through `listr2` so runs can
+ * execute concurrently while still emitting structured progress output.
+ */
 async function main() {
   const args = parseArgs({
     options: {
@@ -72,6 +86,11 @@ async function main() {
     ? createWriteStream(logFile, { flags: "w", encoding: "utf8" })
     : null;
 
+  /**
+   * Append a timestamped message to the verbose log when `--verbose` is set.
+   * The harness passes this callback into `runCase` so low-level diagnostics
+   * integrate with the same log file.
+   */
   const logMessage = (message: string) => {
     if (!logStream) {
       return;
@@ -148,6 +167,10 @@ async function main() {
     result: RunCaseSummary;
   }> = [];
 
+  /**
+   * Execute a single case attempt. Handles JSON parsing, error reporting, and
+   * writing the resulting summary records to the rollout file.
+   */
   async function processIndex(
     i: number,
     k: number,

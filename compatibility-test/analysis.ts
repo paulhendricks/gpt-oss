@@ -1,3 +1,11 @@
+/**
+ * Compute compatibility metrics from the per-attempt rollout records.
+ *
+ * The harness feeds this helper the JSON objects written to
+ * `rollout_<provider>_<timestamp>.jsonl`. We distill those records into
+ * pass@k-style statistics, tool-call quality metrics, and response-shape
+ * summaries that mimic the dashboards used for internal compatibility sweeps.
+ */
 export function analyze(caseResults: any[], tries: number) {
   // Group results by unique task: test_case + apiType
   type TaskKey = string;
@@ -98,6 +106,12 @@ export function analyze(caseResults: any[], tries: number) {
   };
 }
 
+/**
+ * Render the aggregate metrics in a human-readable form on stdout. The CLI
+ * invokes this immediately after writing the analysis JSON so interactive runs
+ * surface the most relevant numbers without forcing users to open additional
+ * files.
+ */
 export function printAnalysis(
   stats: ReturnType<typeof analyze>,
   caseResults: any[],

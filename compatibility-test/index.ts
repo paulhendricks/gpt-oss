@@ -23,11 +23,12 @@ async function main() {
     options: {
       cases: { type: "string", short: "c", default: "cases.jsonl" },
       provider: { type: "string", short: "p", default: "openai" },
-      streaming: { type: "boolean", short: "s", default: false },
+      streaming: { type: "boolean", default: false },
       maxTurns: { type: "string", short: "t", default: "10" },
       n: { type: "string", short: "n" },
-      strict: { type: "boolean", short: "s", default: false },
+      strict: { type: "boolean", default: false },
       tries: { type: "string", short: "k", default: "1" },
+      verbose: { type: "boolean", short: "v", default: false },
     },
   });
   const casesPathArg = args.values.cases;
@@ -38,6 +39,8 @@ async function main() {
   const triesRaw = args.values.tries as string | undefined;
   const tries = triesRaw != null ? Number(triesRaw) : 1;
   const limit = nRaw != null ? Number(nRaw) : undefined;
+  const verbose = Boolean(args.values.verbose);
+  const strict = Boolean(args.values.strict);
   if (limit != null && (!Number.isFinite(limit) || limit <= 0)) {
     console.error("--n must be a positive integer");
     process.exitCode = 1;
@@ -61,13 +64,53 @@ async function main() {
     process.cwd(),
     `analysis_${provider}_${timestamp}.json`
   );
+  const logFile = verbose
+    ? path.join(process.cwd(), `log_${provider}_${timestamp}.log`)
+    : null;
+
+  const logStream = logFile
+    ? createWriteStream(logFile, { flags: "w", encoding: "utf8" })
+    : null;
+
+  const logMessage = (message: string) => {
+    if (!logStream) {
+      return;
+    }
+    const ts = new Date().toISOString();
+    logStream.write(`[${ts}] ${message}\n`);
+  };
+
+  if (logFile) {
+    logMessage(
+      `Verbose logging enabled. Writing detailed output for provider "${provider}".`
+    );
+    logMessage(
+      `Runtime configuration: ${JSON.stringify({
+        casesPath,
+        provider,
+        streaming,
+        strict,
+        maxTurns,
+        tries,
+        limit,
+        outputFile,
+        analysisFile,
+        logFile,
+      })}`
+    );
+  }
 
   let fileContent: string;
   try {
+    logMessage(`Reading cases file from ${casesPath}`);
     fileContent = await readFile(casesPath, "utf8");
+    logMessage(`Successfully read cases file (${fileContent.length} bytes).`);
   } catch (err: any) {
     console.error(
       `Failed to read cases file at ${casesPath}: ${err?.message ?? err}`
+    );
+    logMessage(
+      `Failed to read cases file at ${casesPath}: ${err?.stack ?? err}`
     );
     process.exitCode = 1;
     return;
@@ -80,6 +123,10 @@ async function main() {
 
   const selectedLines =
     typeof limit === "number" ? lines.slice(0, limit) : lines;
+
+  logMessage(
+    `Loaded ${lines.length} total cases; running ${selectedLines.length} based on limit.`
+  );
 
   const out = createWriteStream(outputFile, { flags: "w", encoding: "utf8" });
 
@@ -107,23 +154,37 @@ async function main() {
     task: ListrTaskWrapper<any, any, any>
   ) {
     const line = selectedLines[i];
+    logMessage(`\n=== Case ${i} (attempt ${k + 1}) raw line ===\n${line}`);
     let caseObj: any;
     try {
       caseObj = JSON.parse(line);
+      logMessage(`Parsed case ${i}: ${JSON.stringify(caseObj)}`);
     } catch (err: any) {
       console.error(
         `Skipping invalid JSON on line ${i + 1}: ${err?.message ?? err}`
       );
       skipped++;
+      logMessage(`Skipping invalid JSON on line ${i + 1}: ${err?.message ?? err}`);
       return;
     }
 
     try {
+      logMessage(
+        `Invoking runCase for case ${i} attempt ${k + 1} with options ${JSON.stringify({
+          maxTurns,
+          streaming,
+          strict,
+        })}`
+      );
       const summaries = await runCase(provider, caseObj, {
         maxTurns,
         streaming,
-        strict: args.values.strict,
+        strict,
       });
+
+      logMessage(
+        `Case ${i} (attempt ${k + 1}) returned ${summaries.length} summary entries.`
+      );
 
       for (const summary of summaries) {
         const record = {
@@ -139,7 +200,17 @@ async function main() {
           summary.success ? "Success" : "Failed"
         } ${summary.toolCallingDetails.warning || ""}`;
         caseResults.push(record);
+        logMessage(
+          `Case ${i} (attempt ${k + 1}) ${
+            summary.success ? "succeeded" : "failed"
+          }. Summary: ${JSON.stringify(summary)}`
+        );
         await writeLine(record);
+        logMessage(
+          `Persisted rollout record for run_id ${record.run_id}: ${JSON.stringify(
+            record
+          )}`
+        );
       }
     } catch (err: any) {
       const record = {
@@ -153,6 +224,10 @@ async function main() {
       };
       await writeLine(record);
       task.output = `Case ${i} failed: ${err?.message ?? err}`;
+      logMessage(
+        `Case ${i} failed with error: ${err?.stack ?? err?.message ?? err}`
+      );
+      logMessage(`Persisted error record: ${JSON.stringify(record)}`);
     }
   }
 
@@ -175,10 +250,16 @@ async function main() {
 
   await listr.run();
 
+  logMessage(
+    `Completed processing of ${selectedLines.length} cases across ${tries} attempt(s). Skipped invalid JSON lines: ${skipped}.`
+  );
+
   await new Promise((resolve) => out.end(resolve));
   console.log(`Results written to ${outputFile}`);
+  logMessage(`Results written to ${outputFile}`);
   const stats = analyze(caseResults, tries);
   await writeFile(analysisFile, JSON.stringify(stats, null, 2), "utf8");
+  logMessage(`Computed stats: ${JSON.stringify(stats)}`);
   printAnalysis(
     stats,
     caseResults,
@@ -188,6 +269,15 @@ async function main() {
     skipped,
     analysisFile
   );
+  logMessage(`Analysis written to ${analysisFile}`);
+
+  if (logStream) {
+    logMessage("Closing verbose log stream.");
+    await new Promise<void>((resolve) => {
+      logStream.end(resolve);
+    });
+    console.log(`Verbose log written to ${logFile}`);
+  }
 }
 
 main().catch((err) => {

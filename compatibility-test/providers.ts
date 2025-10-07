@@ -1,3 +1,8 @@
+/**
+ * Registry of provider configurations. Each entry defines the base URL,
+ * credential, supported API types, and optional provider-specific metadata
+ * that the harness forwards with every request.
+ */
 export const PROVIDERS = {
   vllm: {
     apiBaseUrl: "http://localhost:8000/v1",

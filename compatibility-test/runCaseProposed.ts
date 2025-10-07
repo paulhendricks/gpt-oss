@@ -13,6 +13,9 @@ import { OpenAI } from "openai";
 import { PROVIDERS } from "./providers";
 import { TOOLS_MAP } from "./tools";
 
+// logging here!!! comment to enable logs
+console.log = () => {};
+
 setTracingDisabled(true);
 
 const ajv = new Ajv();
@@ -106,6 +109,9 @@ export async function runCase(
     const { success: successToolCall, details: toolCallingDetails } =
       testToolCall(apiType, caseData, result, strict);
 
+    if (streaming) {
+      console.log("DEBUG rawResponses", JSON.stringify(result.rawResponses, null, 2));
+    }
     const { validResponse, details } = testOutputData(
       apiType,
       result.rawResponses,
@@ -113,7 +119,7 @@ export async function runCase(
     );
 
     const { validEvents, details: eventsDetails } = streaming
-      ? testEvents(apiType, streamedEvents ?? [])
+      ? testEvents(apiType, streamedEvents)
       : { validEvents: true, details: {} };
 
     let success = successToolCall && validResponse;
@@ -141,54 +147,77 @@ export async function runCase(
 }
 
 function testToolCall(apiType, caseData, result, strict) {
-  const details: Record<string, any> = {};
+  let details: Record<string, boolean | string> = {};
 
-  for (const item of result.newItems ?? []) {
-    if (details.calledToolAtLeastOnce && (!strict || details.calledToolWithRightArguments)) {
-      break;
-    }
+  // 🔍 DEBUG: inspect what the Runner produced
+  console.log(
+    "DEBUG newItems:",
+    JSON.stringify(
+      result.newItems?.map((i) => ({
+        type: i.type,
+        rawType: i.rawItem?.type ?? i.rawType,
+        name: i.rawItem?.name ?? i.name,
+      })),
+      null,
+      2
+    )
+  );
 
-    if (item?.type !== "tool_call_item") {
-      continue;
-    }
+  result.newItems.forEach((item) => {
+    // For this test we only care if the tool is called at least once
+    // but do NOT early-return globally so we can capture flags.
+    const isToolCall = item.type === "tool_call_item";
+    if (!isToolCall) return;
 
+    // Normalize to handle both rawItem and flat item shapes
     const raw = item.rawItem ?? item;
-    const rawType = item.rawItem?.type ?? item.rawType ?? raw.type;
-    if (rawType !== "function_call") {
-      continue;
-    }
+    const rawType = raw.type ?? item.rawType;
 
-    const toolName = raw.name ?? item.rawItem?.name ?? item.name;
-    if (toolName !== caseData.tool_name) {
-      continue;
-    }
+    if (rawType === "function_call") {
+      if (raw.name === caseData.tool_name) {
+        const validate = ajv.compile(
+          (TOOLS_MAP[caseData.tool_name] as FunctionTool).parameters
+        );
+        const valid = validate(
+          raw.arguments ? JSON.parse(raw.arguments) : {}
+        );
 
-    details.calledToolAtLeastOnce = true;
+        details.calledToolAtLeastOnce = true;
+        details.calledToolWithRightSchema = valid;
 
-    const schema = (TOOLS_MAP[caseData.tool_name] as FunctionTool).parameters;
-    const validate = ajv.compile(schema);
+        if (details.calledToolWithRightSchema) {
+          // 🔍 DEBUG: show what arguments we’re comparing
+          console.log("DEBUG arg check:", {
+            raw: raw.arguments,
+            expected: caseData.expected_arguments,
+          });
 
-    const parsedArguments = normalizeArguments(raw.arguments);
-    const schemaValid = validate(parsedArguments);
-    details.calledToolWithRightSchema = schemaValid;
+          const parsedArguments = raw.arguments
+            ? JSON.parse(raw.arguments)
+            : {};
+          const expectedArguments = caseData.expected_arguments
+            ? JSON.parse(caseData.expected_arguments)
+            : {};
 
-    if (!schemaValid) {
-      if (validate.errors) {
-        details.schemaErrors = validate.errors;
+          details.calledToolWithRightArguments = deepEqual(
+            parsedArguments,
+            expectedArguments
+          );
+
+          if (!details.calledToolWithRightArguments) {
+            details.warning = `Tool call with wrong arguments but correct schema. Parsed: ${JSON.stringify(
+              parsedArguments
+            )} Expected: ${JSON.stringify(expectedArguments)}`;
+            details.actualArguments = parsedArguments;
+            details.expectedArguments = expectedArguments;
+          }
+        }
       }
-      continue;
     }
+  });
 
-    const expectedArguments = normalizeArguments(caseData.expected_arguments);
-    const argumentsMatch = deepEqual(parsedArguments, expectedArguments);
-    details.calledToolWithRightArguments = argumentsMatch;
-
-    if (!argumentsMatch) {
-      details.warning = `Tool call with wrong arguments but correct schema. Parsed: ${JSON.stringify(parsedArguments)} Expected: ${JSON.stringify(expectedArguments)}`;
-      details.actualArguments = parsedArguments;
-      details.expectedArguments = expectedArguments;
-    }
-  }
+  // 🔍 Final debug for flag summary
+  console.log("DEBUG tool flags:", details);
 
   return {
     success:
@@ -200,19 +229,20 @@ function testToolCall(apiType, caseData, result, strict) {
 }
 
 function testEvents(apiType, events) {
+  // In an ideal world we would check all the events to follow and reconstruct the final response
+  // and then compare it against the final response in the response.completed event.
+  // For now, we just check that certain events are present.
+
   let details: Record<string, boolean> = {};
   let validEvents: boolean = false;
 
-  const observedEvents = events ?? [];
-
   if (apiType === "chat") {
     let hasReasoningDeltas = false;
-    for (const event of observedEvents) {
-      const reasoning = event?.choices?.[0]?.delta?.reasoning;
-      if (typeof reasoning === "string" && reasoning.length > 0) {
-        hasReasoningDeltas = true;
-        break;
-      }
+    for (const event of events) {
+      hasReasoningDeltas =
+        hasReasoningDeltas ||
+        (typeof event.choices?.[0]?.delta?.reasoning === "string" &&
+          event.choices[0].delta.reasoning.length > 0);
     }
     details.hasReasoningDeltas = hasReasoningDeltas;
     validEvents = hasReasoningDeltas;
@@ -222,30 +252,36 @@ function testEvents(apiType, events) {
     let hasReasoningDeltaEvents = false;
     let hasReasoningDoneEvents = false;
 
-    for (const event of observedEvents) {
-      const eventType = (
-        event?.data?.event?.type ??
-        event?.type ??
-        event?.data?.type ??
-        ""
-      );
+    // 🔍 DEBUG: print event summary before checking
+    console.log(
+      "DEBUG streaming event types:",
+      events?.map((e) => e?.data?.event?.type || e?.type || e?.data?.type)
+    );
+
+    for (const event of events) {
+      // Support both nested (OpenAI SDK style) and flat stream events
+      const eventType =
+        event?.data?.event?.type ||
+        event?.type ||
+        event?.data?.type ||
+        "";
 
       if (eventType === "response.reasoning_text.delta") {
         hasReasoningDeltaEvents = true;
+        console.log("DEBUG found reasoning delta event");
       }
 
       if (eventType === "response.reasoning_text.done") {
         hasReasoningDoneEvents = true;
+        console.log("DEBUG found reasoning done event");
       }
     }
 
     details.hasReasoningDeltaEvents = hasReasoningDeltaEvents;
     details.hasReasoningDoneEvents = hasReasoningDoneEvents;
-    validEvents = hasReasoningDeltaEvents && hasReasoningDoneEvents;
-  }
 
-  if (observedEvents.length === 0) {
-    details.missingEvents = true;
+    validEvents =
+      details.hasReasoningDeltaEvents && details.hasReasoningDoneEvents;
   }
 
   return {
@@ -258,18 +294,11 @@ function testOutputData(apiType, rawResponses, streaming) {
   let details: Record<string, boolean> = {};
   let validResponse: boolean = false;
 
-  if (!Array.isArray(rawResponses) || rawResponses.length === 0) {
-    return {
-      validResponse: false,
-      details: {
-        missingResponses: true,
-      },
-    };
-  }
-
   if (apiType === "chat") {
     for (const response of rawResponses) {
       if (streaming && !response.providerData) {
+        // With Chat Completions we don't have a final response object that's native
+        // so we skip this test.
         return {
           validResponse: true,
           details: {
@@ -278,6 +307,9 @@ function testOutputData(apiType, rawResponses, streaming) {
         };
       }
 
+      // This is the actual HTTP response from the provider.
+      // Since it's not guaranteed that every response has a reasoning field,
+      // we check if it's present at least once across all responses.
       const data = response.providerData;
       const message = data.choices[0].message;
       if (message.role === "assistant" && !message.refusal) {
@@ -302,6 +334,7 @@ function testOutputData(apiType, rawResponses, streaming) {
       return { validResponse: false, details: { missingOutput: true } };
     }
 
+    // 🔧 Normalize 'unknown' types globally before checking reasoning.
     for (const item of data.output) {
       if (item.type === "unknown" && typeof item.providerData?.type === "string") {
         item.type = item.providerData.type;
@@ -311,53 +344,27 @@ function testOutputData(apiType, rawResponses, streaming) {
     for (const item of data.output) {
       if (item.type === "reasoning") {
         details.hasReasoningContentArray = Array.isArray(item.content);
-        details.hasReasoningContentArrayLength =
-          details.hasReasoningContentArray && item.content.length > 0;
-        details.hasReasoningContentArrayItemType =
-          details.hasReasoningContentArray &&
-          item.content.every(
-            (c: any) => c.type === "reasoning_text" || c.type === "input_text"
-          );
-        details.hasReasoningContentArrayItemText =
-          details.hasReasoningContentArray &&
-          item.content.every(
-            (c: any) => typeof c.text === "string" && c.text.length > 0
-          );
+        details.hasReasoningContentArrayLength = item.content.length > 0;
+        details.hasReasoningContentArrayItemType = item.content.every(
+          (c) => c.type === "reasoning_text" || c.type === "input_text"
+        );
+        details.hasReasoningContentArrayItemText = item.content.every(
+          (c) => c.text.length > 0
+        );
 
         validResponse =
-          validResponse ||
-          (details.hasReasoningContentArray &&
-            details.hasReasoningContentArrayLength &&
-            details.hasReasoningContentArrayItemType &&
-            details.hasReasoningContentArrayItemText);
+          details.hasReasoningContentArray &&
+          details.hasReasoningContentArrayLength &&
+          details.hasReasoningContentArrayItemType &&
+          details.hasReasoningContentArrayItemText;
       }
     }
   }
-
+    
   return {
     validResponse,
     details,
   };
-}
-
-function normalizeArguments(payload: unknown): Record<string, any> {
-  if (payload == null) {
-    return {};
-  }
-
-  if (typeof payload === "string") {
-    try {
-      return JSON.parse(payload);
-    } catch (error) {
-      return {};
-    }
-  }
-
-  if (typeof payload === "object") {
-    return payload as Record<string, any>;
-  }
-
-  return {};
 }
 
 function deepEqual(a: any, b: any): boolean {
